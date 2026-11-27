@@ -3,6 +3,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import time
 from datetime import date, datetime, time as clock, timedelta
@@ -13,10 +14,13 @@ from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent
 POSTS = BASE / "posts.json"
-STATE = BASE / "bale-state.json"
+STATE = BASE / "bale-services-state.json"
 TEHRAN = ZoneInfo("Asia/Tehran")
-WINDOW_START, WINDOW_END = clock(7), clock(19)
-PHOTO = re.compile(r"onesms-day-\d{2}\.png")
+POST_TIMES = ("10:30", "14:30", "17:30")
+POST_KINDS = ("photo", "text", "text")
+DAYS = 60
+SLOTS_PER_DAY = len(POST_TIMES)
+WINDOW_START, WINDOW_END = clock.fromisoformat(POST_TIMES[0]), clock(23, 59)
 CHAT = re.compile(r"@[a-zA-Z0-9_]+|-?[1-9][0-9]{0,15}")
 TOKEN = re.compile(r"\d+:[A-Za-z0-9_-]+")
 
@@ -35,40 +39,27 @@ def read_json(path):
 
 def validate_posts():
     posts = read_json(POSTS)
-    if len(posts) != 360:
-        raise ValueError("posts.json must contain exactly 360 posts.")
-    photo_names, messages, questions = set(), set(), set()
+    expected_count = DAYS * SLOTS_PER_DAY
+    if not isinstance(posts, list) or len(posts) != expected_count:
+        raise ValueError(f"posts.json must contain exactly {expected_count} posts.")
+    messages = set()
     for index, post in enumerate(posts):
-        day, zero_slot = divmod(index, 6)
-        day, slot = day + 1, zero_slot + 1
-        kind = ("photo", "text", "text", "text", "text", "poll")[zero_slot]
-        if (post["id"], post["day"], post["slot"], post["kind"]) != (f"onesms-d{day:02}-s{slot}", day, slot, kind):
-            raise ValueError(f"Invalid post order or type at day {day} slot {slot}.")
-        stamp = clock.fromisoformat(post["time"])
-        if stamp.second or stamp.microsecond or not WINDOW_START <= stamp < WINDOW_END:
-            raise ValueError(f"Invalid posting hour at day {day} slot {slot}.")
-        if slot > 1 and post["time"] <= posts[index - 1]["time"]:
-            raise ValueError(f"Posting hours must increase within day {day}.")
-        if kind == "poll":
-            question = post["question"]
-            choices = post["options"]
-            if (not 1 <= len(question) <= 300 or not 2 <= len(choices) <= 12
-                    or not all(1 <= len(choice) <= 100 for choice in choices)
-                    or len(set(choices)) != len(choices) or question in questions):
-                raise ValueError(f"Invalid poll for day {day}.")
-            questions.add(question)
-            continue
+        zero_day, zero_slot = divmod(index, SLOTS_PER_DAY)
+        day, slot = zero_day + 1, zero_slot + 1
+        kind = POST_KINDS[zero_slot]
+        expected = (f"onesms-services-d{day:02}-s{slot}", day, slot, kind, POST_TIMES[zero_slot])
+        if (post["id"], post["day"], post["slot"], post["kind"], post["time"]) != expected:
+            raise ValueError(f"Invalid post order, type or hour at day {day} slot {slot}.")
         body = post["text"]
-        if not 1 <= len(body.encode("utf-16-le")) // 2 <= (1024 if kind == "photo" else 4096) or body in messages:
+        limit = 1024 if kind == "photo" else 4096
+        if not 1 <= len(body.encode("utf-16-le")) // 2 <= limit or body in messages:
             raise ValueError(f"Empty, duplicate or oversized text at day {day} slot {slot}.")
         messages.add(body)
         if kind == "photo":
             name = post["media"]
             asset = BASE / name
-            if (not PHOTO.fullmatch(name) or name in photo_names or not asset.is_file()
-                    or not 8 < asset.stat().st_size <= 10_000_000):
-                raise ValueError(f"Missing, duplicate or invalid photo for day {day}.")
-            photo_names.add(name)
+            if name != f"onesms-day-{day:02}.png" or not asset.is_file() or not 8 < asset.stat().st_size <= 10_000_000:
+                raise ValueError(f"Missing or invalid photo for day {day}.")
     return posts
 
 
@@ -83,7 +74,7 @@ def save_state(state):
     updated.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     updated.replace(STATE)
     for args in (["git", "add", "--", STATE.name],
-                 ["git", "commit", "-m", "Update OneSMS Bale publication state"],
+                 ["git", "commit", "-m", "Update OneSMS Bale services publication state"],
                  ["git", "push", "origin", "HEAD"]):
         result = subprocess.run(args, cwd=BASE, capture_output=True)
         if result.returncode:
@@ -113,7 +104,11 @@ def bale(method, token, fields, photo=None):
         if 400 <= error.code < 500:
             raise BaleRejected(f"Bale rejected {method} with HTTP {error.code}.") from None
         raise UncertainDelivery(f"Bale returned HTTP {error.code} for {method}.") from None
-    except (URLError, OSError, ValueError):
+    except URLError as error:
+        if isinstance(error.reason, (socket.gaierror, ConnectionRefusedError)):
+            raise BaleRejected(f"Connection to Bale could not start for {method}; the next run will retry.") from None
+        raise UncertainDelivery(f"No reliable Bale response for {method}.") from None
+    except (OSError, ValueError):
         raise UncertainDelivery(f"No reliable Bale response for {method}.") from None
     if isinstance(response, dict) and response.get("ok") is False:
         detail = str(response.get("description", "")).replace(token, "[REDACTED]").splitlines()
@@ -123,21 +118,13 @@ def bale(method, token, fields, photo=None):
     return response["result"]
 
 
-def question_text(post):
-    numbers = "۱۲۳۴۵۶۷۸۹"
-    options = "\n".join(f"{numbers[index] if index < len(numbers) else index + 1}. {choice}"
-                        for index, choice in enumerate(post["options"]))
-    return (f"❓ سؤال روز\n\n{post['question']}\n\n{options}"
-            "\n\nاگه دیدگاه‌ها بازه، شماره گزینه‌ات رو بنویس.")
-
-
 def send(post, channel, token):
     fields = {"chat_id": channel}
     if post["kind"] == "photo":
         fields["caption"] = post["text"]
         result = bale("sendPhoto", token, fields, BASE / post["media"])
     else:
-        fields["text"] = question_text(post) if post["kind"] == "poll" else post["text"]
+        fields["text"] = post["text"]
         result = bale("sendMessage", token, fields)
     message_id = result.get("message_id")
     if type(message_id) is not int or message_id <= 0:
@@ -168,12 +155,9 @@ def render(posts, day, slot):
 def show_preview(posts):
     for post in posts:
         print(f"{post['time']} | {post['category']} | {post['id']}")
-        if post["kind"] == "poll":
-            print(question_text(post))
-        else:
-            if post["kind"] == "photo":
-                print(f"Image: {post['media']}")
-            print(post["text"])
+        if post["kind"] == "photo":
+            print(f"Image: {post['media']}")
+        print(post["text"])
         print()
 
 
@@ -212,6 +196,17 @@ def test_day(posts):
         print(f"{post['id']} sent to test. Message ID {send(post, test_channel, token)}")
 
 
+def test_main(posts, day, slot):
+    if slot == 0:
+        raise ValueError("Select slot 1, 2 or 3 for a single test on the production channel.")
+    post, = render(posts, day, slot)
+    token = get_token()
+    channel = channel_id(get_channel("BALE_CHANNEL_ID"), token)
+    annotated = {**post, "text": "🧪 تست انتشار\n\n" + post["text"]}
+    message_id = send(annotated, channel, token)
+    print(f"{post['id']} sent as a test to the production channel. Bale message ID {message_id}.")
+
+
 def due_posts(posts, state, now, start):
     if not start:
         return []
@@ -222,7 +217,7 @@ def due_posts(posts, state, now, start):
 
 
 def show_status(posts, state, now):
-    start = state["start_date"] or os.environ.get("BALE_CAMPAIGN_START_DATE", "").strip()
+    start = state["start_date"] or os.environ.get("BALE_SERVICE_CAMPAIGN_START_DATE", "").strip()
     due = due_posts(posts, state, now, start)
     today = [receipt for receipt in state["sent"].values()
              if datetime.fromisoformat(receipt["at"]).astimezone(TEHRAN).date() == now.date()]
@@ -235,23 +230,51 @@ def show_status(posts, state, now):
         print(f"{receipt['at']} | {receipt['id']} | Bale message ID {receipt['message_id']}")
 
 
+def posting_enabled():
+    return os.environ.get("ENABLE_BALE_POSTING", "").strip().lower() == "true"
+
+
+def audit_publication(posts, state, now):
+    if not posting_enabled():
+        print("Publication audit skipped: automatic posting is paused.")
+        return
+    start = state["start_date"] or os.environ.get("BALE_SERVICE_CAMPAIGN_START_DATE", "").strip()
+    if not start:
+        raise ValueError("Set BALE_SERVICE_CAMPAIGN_START_DATE (YYYY-MM-DD, Tehran local date) in Actions variables.")
+    yesterday = now.date() - timedelta(days=1)
+    cutoff = datetime.combine(yesterday, clock.max, TEHRAN)
+    confirmed = {
+        post_id: receipt for post_id, receipt in state["sent"].items()
+        if datetime.fromisoformat(receipt["at"]).astimezone(TEHRAN) <= cutoff
+    }
+    overdue = due_posts(posts, {"sent": confirmed}, cutoff, start)
+    if overdue:
+        examples = ", ".join(post["id"] for post in overdue[:6])
+        detail = f" Pending verification: {state['pending']['id']}." if state["pending"] else ""
+        raise RuntimeError(
+            f"{len(overdue)} scheduled post(s) lacked publication confirmation by the end "
+            f"of {yesterday.isoformat()} Tehran. Oldest: {examples}.{detail}"
+        )
+    print(f"All posts due by the end of {yesterday.isoformat()} Tehran were confirmed.")
+
+
 def publish_next(posts, state, now):
-    if os.environ.get("ENABLE_BALE_POSTING", "").strip().lower() != "true":
+    if not posting_enabled():
         print("Automatic posting is disabled. Set the Actions variable ENABLE_BALE_POSTING to true when ready.")
         return
     if not WINDOW_START <= now.time() < WINDOW_END:
-        print("Outside 07:00–19:00 Tehran. Scheduled posts stay in the queue.")
+        print("Outside 10:30–23:59 Tehran. Scheduled posts stay in the queue.")
         return
     if state["pending"]:
         raise RuntimeError(f"Inspect Bale before retrying pending post {state['pending']['id']}.")
-    start = state["start_date"] or os.environ.get("BALE_CAMPAIGN_START_DATE", "").strip()
+    start = state["start_date"] or os.environ.get("BALE_SERVICE_CAMPAIGN_START_DATE", "").strip()
     if not start:
-        raise ValueError("Set BALE_CAMPAIGN_START_DATE (YYYY-MM-DD, Tehran local date) in Actions variables.")
+        raise ValueError("Set BALE_SERVICE_CAMPAIGN_START_DATE (YYYY-MM-DD, Tehran local date) in Actions variables.")
     if len(state["sent"]) == len(posts):
-        print("All 360 posts have been sent.")
+        print(f"All {len(posts)} posts have been sent.")
         return
     recent = sorted(datetime.fromisoformat(entry["at"]).astimezone(TEHRAN) for entry in state["sent"].values())
-    if len([stamp for stamp in recent if stamp.date() == now.date()]) >= 6:
+    if len([stamp for stamp in recent if stamp.date() == now.date()]) >= SLOTS_PER_DAY:
         print("Daily cap reached. Unsent posts remain queued.")
         return
     if recent and now - recent[-1] < timedelta(minutes=20):
@@ -262,17 +285,19 @@ def publish_next(posts, state, now):
         print("No post due yet.")
         return
     post = due[0]
+    publication_day = now.date()
     token = get_token()
     channel = channel_id(get_channel("BALE_CHANNEL_ID"), token)
     if state["channel"] and state["channel"] != channel:
         raise ValueError("Production channel differs from the saved Bale channel.")
     now = datetime.now(TEHRAN)
-    if not WINDOW_START <= now.time() < WINDOW_END:
+    if now.date() != publication_day or not WINDOW_START <= now.time() < WINDOW_END:
         print("Posting window just closed. The post remains queued.")
         return
     state.update(channel=channel, start_date=start, pending={"id": post["id"], "at": now.isoformat()})
     save_state(state)
-    if not WINDOW_START <= datetime.now(TEHRAN).time() < WINDOW_END:
+    after_save = datetime.now(TEHRAN)
+    if after_save.date() != publication_day or not WINDOW_START <= after_save.time() < WINDOW_END:
         state["pending"] = None
         save_state(state)
         print("Posting window closed while recording state. The post remains queued.")
@@ -291,22 +316,26 @@ def publish_next(posts, state, now):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["validate", "preview", "check", "test", "publish", "status"], default="preview")
-    parser.add_argument("--day", type=int, choices=range(1, 61), default=1, metavar="1..60")
-    parser.add_argument("--slot", type=int, choices=range(7), default=0, metavar="0..6")
+    parser.add_argument("--mode", choices=["validate", "preview", "check", "test", "test_main", "publish", "status", "audit"], default="preview")
+    parser.add_argument("--day", type=int, choices=range(1, DAYS + 1), default=1, metavar="1..60")
+    parser.add_argument("--slot", type=int, choices=range(SLOTS_PER_DAY + 1), default=0, metavar="0..3")
     args = parser.parse_args()
     try:
         posts = validate_posts()
         if args.mode == "validate":
-            print("360 posts and 60 photo files validated.")
+            print(f"{len(posts)} posts and {DAYS} photo files validated.")
         elif args.mode == "preview":
             show_preview(render(posts, args.day, args.slot))
         elif args.mode == "check":
             check_channels()
         elif args.mode == "test":
             test_day(render(posts, args.day, args.slot))
+        elif args.mode == "test_main":
+            test_main(posts, args.day, args.slot)
         elif args.mode == "status":
             show_status(posts, repository_state(), datetime.now(TEHRAN))
+        elif args.mode == "audit":
+            audit_publication(posts, repository_state(), datetime.now(TEHRAN))
         else:
             publish_next(posts, repository_state(), datetime.now(TEHRAN))
     except (RuntimeError, ValueError, OSError, KeyError, TypeError) as error:
